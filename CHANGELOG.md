@@ -1,5 +1,12 @@
 # Changelog
 
+## [3.28.1](https://github.com/qixing-jk/all-api-hub/compare/v3.28.0...v3.28.1) (2026-03-17)
+
+
+### Bug Fixes
+
+* **KeyManagement:** enhance token visibility with loading state ([8a379e9](https://github.com/qixing-jk/all-api-hub/commit/8a379e9d11b9c88af720b7522cdf34965faf7f4b))
+
 ## [3.28.0](https://github.com/qixing-jk/all-api-hub/compare/v3.27.0...v3.28.0) (2026-03-16)
 
 
