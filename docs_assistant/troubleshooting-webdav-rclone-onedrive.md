@@ -45,52 +45,71 @@ Docs reference: `docs/docs/en/webdav-sync.md` (and `docs/docs/webdav-sync.md`) e
 
 ## 4) Pick one approach to “make it appear in OneDrive”
 
-### Option A — Periodically snapshot the current WebDAV backup into OneDrive (daily) + keep only the latest 3 copies (recommended)
+### Option A — Daily OneDrive snapshots of your WebDAV backup (retain last 3)
 
-**Goal:** You keep using WebDAV for multi-device sync (single canonical file), *and* you get a separate OneDrive “time machine” with retention.
+This is the simplest setup that matches your goal:
 
-**Important detail:** All API Hub WebDAV auto-sync typically overwrites the same path:
+- WebDAV stays as your **single canonical sync point** for all devices.
+- The server additionally creates **one snapshot per day** in OneDrive.
+- OneDrive keeps only the **latest 3** snapshots (older ones are purged).
 
-- Local file (from your container bind mount):
+#### What gets backed up
+
+- **Source (local canonical file):**
   - `/opt/allapihub-webdav/data/will/all-api-hub-backup/all-api-hub-1-0.json`
+- **Destination (OneDrive folder):**
+  - `Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots`
+- **Snapshot naming (one per day):**
+  - `all-api-hub-1-0-YYYY-MM-DD.json` (date is forced to **Asia/Taipei**)
+- **Schedule:**
+  - Daily at **04:44 Asia/Taipei**
 
-So to keep history, your OneDrive backup should be a **daily copy with a date in the filename**, e.g.:
+---
 
-- `.../all-api-hub-1-0-2026-03-20.json`
+## Step-by-step (Cron)
 
-#### A.1 Snapshot script (upload daily + retain last 3)
+Run these commands on the same machine that hosts the WebDAV Docker bind mount.
 
-Create a script on the server that runs the WebDAV container (example: `/opt/scripts/allapihub-webdav-snapshot.sh`).
-
-This version is configured for your decisions:
-- OneDrive destination: `Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots`
-- **One snapshot per day** (same filename per day → overwrites if rerun)
-- Retain **latest 3** snapshots
-- Date stamping is forced to **Asia/Taipei** to avoid “wrong day” around midnight if the server timezone differs
+### 1) Confirm the source file exists
 
 ```bash
+ls -lah /opt/allapihub-webdav/data/will/all-api-hub-backup/
+```
+
+You should see `all-api-hub-1-0.json`.
+
+### 2) Confirm rclone works as user `will`
+
+```bash
+rclone about "Onedrive-Yahooforsub-Tao:"
+rclone lsf "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots" --max-depth 1
+```
+
+This must work **without `sudo`** (because we’ll run cron as `will`, using `~/.config/rclone/rclone.conf`).
+
+### 3) Create the snapshot script
+
+Create `/opt/scripts/allapihub-webdav-snapshot.sh`:
+
+```bash
+sudo mkdir -p /opt/scripts
+
+sudo tee /opt/scripts/allapihub-webdav-snapshot.sh > /dev/null <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Cron/systemd may have a minimal PATH; ensure `rclone` is found.
+# Cron runs with a minimal environment; ensure rclone is found.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-# Local file written by your WebDAV container
 SRC_FILE="/opt/allapihub-webdav/data/will/all-api-hub-backup/all-api-hub-1-0.json"
-
-# Your rclone remote + destination folder in OneDrive
-# NOTE: rclone paths use forward slashes.
 RCLONE_REMOTE="Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots"
-
-# Filename prefix for snapshots
 PREFIX="all-api-hub-1-0"
 
-# Use ISO date so lexicographic order == chronological order
-# Force Taipei timezone for consistent naming
+# Force Taipei date for stable daily naming even if server timezone differs
 STAMP="$(TZ=Asia/Taipei date +%F)"
 DEST_FILE="${PREFIX}-${STAMP}.json"
 
-# Avoid overlapping runs
+# Prevent overlapping runs
 LOCK_FILE="/tmp/allapihub-webdav-snapshot.lock"
 exec 9>"${LOCK_FILE}"
 if ! flock -n 9; then
@@ -103,11 +122,11 @@ if [[ ! -f "${SRC_FILE}" ]]; then
   exit 1
 fi
 
-# 1) Upload snapshot (idempotent for same day)
+# Upload (same-day reruns overwrite the same file)
 rclone mkdir "${RCLONE_REMOTE}" >/dev/null 2>&1 || true
 rclone copyto "${SRC_FILE}" "${RCLONE_REMOTE}/${DEST_FILE}" -P
 
-# 2) Retain only the newest 3 snapshots (by filename ordering)
+# Keep only the newest 3 snapshots (ISO date filenames sort correctly)
 mapfile -t files < <(
   rclone lsf "${RCLONE_REMOTE}" \
     --files-only \
@@ -115,8 +134,8 @@ mapfile -t files < <(
   | sort
 )
 
-count="${#files[@]}"
 keep=3
+count="${#files[@]}"
 
 if (( count > keep )); then
   delete_count=$((count - keep))
@@ -128,51 +147,63 @@ if (( count > keep )); then
 fi
 
 echo "Done. Total snapshots now: ${#files[@]} (kept last ${keep})."
-```
+EOF
 
-Make it executable:
-
-```bash
-sudo mkdir -p /opt/scripts
-sudo nano /opt/scripts/allapihub-webdav-snapshot.sh
 sudo chmod +x /opt/scripts/allapihub-webdav-snapshot.sh
+sudo chown will:will /opt/scripts/allapihub-webdav-snapshot.sh
 ```
 
-**Important:** run this as the same Linux user that has your `rclone` config for `Onedrive-Yahooforsub-Tao` (often your non-root user, e.g. `will`).
+If you see `flock: command not found`, install it (package is typically `util-linux`).
 
-Test it once manually:
+### 4) Test the script once
 
 ```bash
 /opt/scripts/allapihub-webdav-snapshot.sh
 rclone lsf "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots" --max-depth 1
 ```
 
-#### A.2 Schedule it daily (Asia/Taipei 04:44)
+You should see a file like `all-api-hub-1-0-YYYY-MM-DD.json`.
 
-Yes: the correct pattern is **cron (or systemd timer) → run the snapshot script → script uploads + purges**.
+### 5) Create the cron job (04:44 Asia/Taipei)
 
-**Cron (simple):**
+Edit crontab as user `will`:
 
-- If your server timezone is already Asia/Taipei, use:
-
-```cron
-44 4 * * * /opt/scripts/allapihub-webdav-snapshot.sh >> "$HOME/allapihub-webdav-snapshot.log" 2>&1
+```bash
+crontab -e
 ```
 
-- If your server timezone is *not* Asia/Taipei, use `CRON_TZ` to force Taipei scheduling:
+Add:
 
 ```cron
 CRON_TZ=Asia/Taipei
 44 4 * * * /opt/scripts/allapihub-webdav-snapshot.sh >> "$HOME/allapihub-webdav-snapshot.log" 2>&1
 ```
 
-Edit your user crontab (recommended: run as `will` so it uses `~/.config/rclone/rclone.conf`):
+### 6) Verify it’s running
+
+- Check your job log:
 
 ```bash
-crontab -e
+tail -n 200 "$HOME/allapihub-webdav-snapshot.log"
 ```
 
-**systemd timer (recommended for servers):**
+- Check system cron logs (location varies by distro):
+  - Ubuntu/Debian: `/var/log/syslog`
+  - RHEL/CentOS: `/var/log/cron`
+
+### 7) Verify retention (only 3 snapshots)
+
+After multiple days, confirm only 3 files remain:
+
+```bash
+rclone lsf "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots" --max-depth 1
+```
+
+---
+
+## Optional: systemd timer (alternative to cron)
+
+If you prefer systemd timers (more observable than cron), you can create a timer at 04:44 Asia/Taipei and run the same script.
 
 Create `/etc/systemd/system/allapihub-webdav-snapshot.service`:
 
@@ -182,6 +213,7 @@ Description=Snapshot All API Hub WebDAV backup into OneDrive (rclone)
 
 [Service]
 Type=oneshot
+User=will
 ExecStart=/opt/scripts/allapihub-webdav-snapshot.sh
 ```
 
@@ -208,32 +240,6 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now allapihub-webdav-snapshot.timer
 sudo systemctl list-timers --all | grep allapihub
 ```
-
-#### A.3 Quick verification commands
-
-```bash
-# Local exists
-ls -lah /opt/allapihub-webdav/data/will/all-api-hub-backup/
-
-# Remote snapshots
-rclone lsf "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots" --max-depth 1
-```
-
-Pros
-- WebDAV sync remains stable (single canonical file) for all devices.
-- You get offsite history in OneDrive with deterministic retention.
-- Works even if the extension overwrites the same WebDAV JSON repeatedly.
-
-Cons
-- Daily backups are “point-in-time” (not continuous).
-
-Notes
-- If you previously used a Windows path like `Scripts-ssh-ssl-keys\Allapihub`, switch to **forward slashes** in rclone paths.
-- If you prefer “keep last 3 *days*” instead of “keep last 3 *copies*”, we can simplify retention with `rclone delete --min-age`.
-
-Scheduling
-- `cron` (quick)
-- `systemd timer` (more robust)
 
 ### Option B — Mount OneDrive into the WebDAV data directory (near real-time)
 
