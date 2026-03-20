@@ -45,47 +45,158 @@ Docs reference: `docs/docs/en/webdav-sync.md` (and `docs/docs/webdav-sync.md`) e
 
 ## 4) Pick one approach to “make it appear in OneDrive”
 
-### Option A — Periodically upload the WebDAV data directory to OneDrive (recommended)
+### Option A — Periodically snapshot the current WebDAV backup into OneDrive (daily) + keep only the latest 3 copies (recommended)
 
-**Concept:** WebDAV writes to local disk → rclone copies that folder to OneDrive on a schedule.
+**Goal:** You keep using WebDAV for multi-device sync (single canonical file), *and* you get a separate OneDrive “time machine” with retention.
 
-Pros
-- Stable and simple.
-- WebDAV stays fast (local disk).
-- OneDrive uploads happen independently; transient OneDrive errors don’t break WebDAV writes.
+**Important detail:** All API Hub WebDAV auto-sync typically overwrites the same path:
 
-Cons
-- Not “instant” unless you run it frequently.
-- You must decide between `copy` vs `sync`.
+- Local file (from your container bind mount):
+  - `/opt/allapihub-webdav/data/will/all-api-hub-backup/all-api-hub-1-0.json`
 
-Suggested commands (Linux)
+So to keep history, your OneDrive backup should be a **daily copy with a date in the filename**, e.g.:
+
+- `.../all-api-hub-1-0-2026-03-20.json`
+
+#### A.1 Snapshot script (upload daily + retain last 3)
+
+Create a script on the server that runs the WebDAV container (example: `/opt/scripts/allapihub-webdav-snapshot.sh`):
 
 ```bash
-# Verify the file exists locally
-ls -lah /opt/allapihub-webdav/data/will/all-api-hub-backup/
+#!/usr/bin/env bash
+set -euo pipefail
 
-# List target folder in OneDrive (rclone uses forward slashes)
-rclone lsf "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub" --dirs-only
+# Local file written by your WebDAV container
+SRC_FILE="/opt/allapihub-webdav/data/will/all-api-hub-backup/all-api-hub-1-0.json"
 
-# One-way upload (does NOT delete remote files)
-rclone copy \
-  "/opt/allapihub-webdav/data/will/all-api-hub-backup" \
-  "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/all-api-hub-backup" \
-  --create-empty-src-dirs \
-  -P
+# Your rclone remote + destination folder in OneDrive
+# NOTE: rclone paths use forward slashes.
+RCLONE_REMOTE="Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots"
 
-# Dry run first (recommended)
-rclone copy \
-  "/opt/allapihub-webdav/data/will/all-api-hub-backup" \
-  "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/all-api-hub-backup" \
-  --dry-run -P
+# Filename prefix for snapshots
+PREFIX="all-api-hub-1-0"
+
+# Use ISO date so lexicographic order == chronological order
+STAMP="$(date +%F)"
+DEST_FILE="${PREFIX}-${STAMP}.json"
+
+# Avoid overlapping runs
+LOCK_FILE="/tmp/allapihub-webdav-snapshot.lock"
+exec 9>"${LOCK_FILE}"
+if ! flock -n 9; then
+  echo "Another snapshot job is running; exiting." >&2
+  exit 0
+fi
+
+if [[ ! -f "${SRC_FILE}" ]]; then
+  echo "Source file not found: ${SRC_FILE}" >&2
+  exit 1
+fi
+
+# 1) Upload snapshot (idempotent for same day)
+rclone mkdir "${RCLONE_REMOTE}" >/dev/null 2>&1 || true
+rclone copyto "${SRC_FILE}" "${RCLONE_REMOTE}/${DEST_FILE}" -P
+
+# 2) Retain only the newest 3 snapshots (by filename ordering)
+mapfile -t files < <(
+  rclone lsf "${RCLONE_REMOTE}" \
+    --files-only \
+    --include "${PREFIX}-*.json" \
+  | sort
+)
+
+count="${#files[@]}"
+keep=3
+
+if (( count > keep )); then
+  delete_count=$((count - keep))
+  for ((i=0; i<delete_count; i++)); do
+    f="${files[$i]}"
+    echo "Purging old snapshot: ${f}"
+    rclone deletefile "${RCLONE_REMOTE}/${f}"
+  done
+fi
+
+echo "Done. Total snapshots now: ${count} (kept last ${keep})."
 ```
 
-Notes
-- If you use `rclone sync` instead of `copy`, it will **delete** remote files not present locally. Only do that if you want the remote to mirror local exactly.
-- If you previously used a Windows path like `Scripts-ssh-ssl-keys\Allapihub`, switch to **forward slashes** in rclone paths.
+Make it executable:
 
-Scheduling (choose one)
+```bash
+sudo mkdir -p /opt/scripts
+sudo nano /opt/scripts/allapihub-webdav-snapshot.sh
+sudo chmod +x /opt/scripts/allapihub-webdav-snapshot.sh
+```
+
+#### A.2 Schedule it daily
+
+**Cron (simple):**
+
+```bash
+crontab -e
+# Run daily at 02:15
+15 2 * * * /opt/scripts/allapihub-webdav-snapshot.sh >> /var/log/allapihub-webdav-snapshot.log 2>&1
+```
+
+**systemd timer (recommended for servers):**
+
+Create `/etc/systemd/system/allapihub-webdav-snapshot.service`:
+
+```ini
+[Unit]
+Description=Snapshot All API Hub WebDAV backup into OneDrive (rclone)
+
+[Service]
+Type=oneshot
+ExecStart=/opt/scripts/allapihub-webdav-snapshot.sh
+```
+
+Create `/etc/systemd/system/allapihub-webdav-snapshot.timer`:
+
+```ini
+[Unit]
+Description=Daily OneDrive snapshot for All API Hub WebDAV
+
+[Timer]
+OnCalendar=daily
+Persistent=true
+RandomizedDelaySec=10m
+
+[Install]
+WantedBy=timers.target
+```
+
+Enable:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now allapihub-webdav-snapshot.timer
+sudo systemctl list-timers --all | grep allapihub
+```
+
+#### A.3 Quick verification commands
+
+```bash
+# Local exists
+ls -lah /opt/allapihub-webdav/data/will/all-api-hub-backup/
+
+# Remote snapshots
+rclone lsf "Onedrive-Yahooforsub-Tao:Scripts-ssh-ssl-keys/Allapihub/webdav-snapshots" --max-depth 1
+```
+
+Pros
+- WebDAV sync remains stable (single canonical file) for all devices.
+- You get offsite history in OneDrive with deterministic retention.
+- Works even if the extension overwrites the same WebDAV JSON repeatedly.
+
+Cons
+- Daily backups are “point-in-time” (not continuous).
+
+Notes
+- If you previously used a Windows path like `Scripts-ssh-ssl-keys\Allapihub`, switch to **forward slashes** in rclone paths.
+- If you prefer “keep last 3 *days*” instead of “keep last 3 *copies*”, we can simplify retention with `rclone delete --min-age`.
+
+Scheduling
 - `cron` (quick)
 - `systemd timer` (more robust)
 
